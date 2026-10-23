@@ -133,7 +133,8 @@ impl KeyPackageIn {
     /// * verify that the ciphersuite is supported by the crypto provider
     /// * verify that the signature on this key package is valid
     /// * verify that the signature on the leaf node is valid
-    /// * verify that all extensions are supported by the leaf node
+    /// * verify that extensions in this key package and in the leaf node are
+    ///   covered by the leaf node's capabilities
     /// * make sure that the lifetime is valid
     /// * make sure that the init key and the encryption key are different
     /// * make sure that the protocol version is valid
@@ -206,11 +207,9 @@ impl KeyPackageIn {
 
         // Extension included in the extensions or leaf_node.extensions fields
         // MUST be included in the leaf_node.capabilities field.
-        if !key_package
-            .payload
-            .leaf_node
-            .capabilities()
-            .contains_extensions(&key_package.payload.extensions)
+        let capabilities = key_package.payload.leaf_node.capabilities();
+        if !capabilities.contains_extensions(&key_package.payload.extensions)
+            || !capabilities.contains_extensions(key_package.payload.leaf_node.extensions())
         {
             return Err(KeyPackageVerifyError::UnsupportedExtension);
         }

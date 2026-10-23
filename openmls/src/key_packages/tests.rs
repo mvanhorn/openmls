@@ -1,5 +1,6 @@
 use crate::{
-    prelude::ExtensionTypeNotValidInLeafNodeError, test_utils::*,
+    prelude::{ExtensionTypeNotValidInLeafNodeError, LeafNodeLifetimePolicy},
+    test_utils::*,
     treesync::node::leaf_node::Capabilities,
 };
 use openmls_basic_credential::SignatureKeyPair;
@@ -224,6 +225,155 @@ fn key_package_validation() {
 
     // Expect an invalid init/encryption key error
     assert_eq!(err, KeyPackageVerifyError::InitKeyEqualsEncryptionKey);
+}
+
+/// Leaf-node extensions must be covered by the leaf's capabilities.
+///
+/// Standalone validation checks the outer KeyPackage extensions and
+/// `leaf_node.extensions`. Default extensions stay implicitly supported; see
+/// [`application_id_extension`].
+#[openmls_test::openmls_test]
+fn key_package_leaf_extension_capabilities() {
+    let provider = &Provider::default();
+    let credential = Credential::from(BasicCredential::new(b"Sasha".to_vec()));
+    let signature_keys = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_with_key = CredentialWithKey {
+        signature_key: signature_keys.to_public_vec().into(),
+        credential,
+    };
+
+    // Unknown, non-default types. Outside the registered range and not GREASE.
+    const LEAF_EXTENSION_A: u16 = 0xFF00;
+    const LEAF_EXTENSION_B: u16 = 0xFF01;
+    const KEY_PACKAGE_EXTENSION: u16 = 0xFF02;
+
+    let key_package = KeyPackage::builder()
+        .leaf_node_capabilities(
+            Capabilities::builder()
+                .ciphersuites(vec![ciphersuite])
+                .credentials(vec![CredentialType::Basic])
+                .extensions(vec![
+                    ExtensionType::Unknown(LEAF_EXTENSION_A),
+                    ExtensionType::Unknown(LEAF_EXTENSION_B),
+                ])
+                .build(),
+        )
+        // The outer list stays empty so only the leaf-extension check can fail.
+        .leaf_node_extensions(
+            Extensions::from_vec(vec![
+                Extension::Unknown(LEAF_EXTENSION_A, UnknownExtension(vec![])),
+                Extension::Unknown(LEAF_EXTENSION_B, UnknownExtension(vec![1])),
+            ])
+            .expect("unknown extensions are valid in leaf nodes"),
+        )
+        .build(
+            ciphersuite,
+            provider,
+            &signature_keys,
+            credential_with_key.clone(),
+        )
+        .expect("failed to build the key package");
+
+    assert!(key_package
+        .key_package()
+        .extensions()
+        .iter()
+        .next()
+        .is_none());
+    KeyPackageIn::from(key_package.key_package().clone())
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .expect("a package whose leaf capabilities cover its extensions is valid");
+
+    // One missing capability among several leaf extension types is enough.
+    for missing in [LEAF_EXTENSION_A, LEAF_EXTENSION_B] {
+        let mut franken_key_package =
+            frankenstein::FrankenKeyPackage::from(key_package.key_package().clone());
+        let extensions = &mut franken_key_package
+            .payload
+            .leaf_node
+            .payload
+            .capabilities
+            .extensions;
+        let before = extensions.len();
+        extensions.retain(|extension_type| *extension_type != missing);
+        assert_eq!(extensions.len(), before - 1);
+        franken_key_package.resign(&signature_keys);
+
+        let err = KeyPackageIn::from(franken_key_package.clone())
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .expect_err("a leaf extension missing from capabilities must be rejected");
+        assert_eq!(err, KeyPackageVerifyError::UnsupportedExtension);
+
+        // Skipping lifetime verification must not bypass the capability check.
+        let err = KeyPackageIn::from(franken_key_package.clone())
+            .validate_with_lifetime_policy(
+                provider.crypto(),
+                ProtocolVersion::Mls10,
+                LeafNodeLifetimePolicy::Skip,
+            )
+            .expect_err("skipping the lifetime check must not skip capability validation");
+        assert_eq!(err, KeyPackageVerifyError::UnsupportedExtension);
+
+        franken_key_package
+            .payload
+            .leaf_node
+            .payload
+            .capabilities
+            .extensions
+            .push(missing);
+        franken_key_package.resign(&signature_keys);
+        KeyPackageIn::from(franken_key_package)
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .expect("restoring the leaf capability must make the package valid");
+    }
+
+    // A missing outer capability still fails when every leaf extension is supported.
+    let key_package = KeyPackage::builder()
+        .leaf_node_capabilities(
+            Capabilities::builder()
+                .ciphersuites(vec![ciphersuite])
+                .credentials(vec![CredentialType::Basic])
+                .extensions(vec![
+                    ExtensionType::Unknown(LEAF_EXTENSION_A),
+                    ExtensionType::Unknown(LEAF_EXTENSION_B),
+                    ExtensionType::Unknown(KEY_PACKAGE_EXTENSION),
+                ])
+                .build(),
+        )
+        .leaf_node_extensions(
+            Extensions::from_vec(vec![
+                Extension::Unknown(LEAF_EXTENSION_A, UnknownExtension(vec![])),
+                Extension::Unknown(LEAF_EXTENSION_B, UnknownExtension(vec![1])),
+            ])
+            .expect("unknown extensions are valid in leaf nodes"),
+        )
+        .key_package_extensions(
+            Extensions::single(Extension::Unknown(
+                KEY_PACKAGE_EXTENSION,
+                UnknownExtension(vec![]),
+            ))
+            .expect("unknown extensions are valid in key packages"),
+        )
+        .build(ciphersuite, provider, &signature_keys, credential_with_key)
+        .expect("failed to build the key package");
+
+    let mut franken_key_package =
+        frankenstein::FrankenKeyPackage::from(key_package.key_package().clone());
+    let extensions = &mut franken_key_package
+        .payload
+        .leaf_node
+        .payload
+        .capabilities
+        .extensions;
+    let before = extensions.len();
+    extensions.retain(|extension_type| *extension_type != KEY_PACKAGE_EXTENSION);
+    assert_eq!(extensions.len(), before - 1);
+    franken_key_package.resign(&signature_keys);
+
+    let err = KeyPackageIn::from(franken_key_package)
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .expect_err("an outer extension missing from capabilities must be rejected");
+    assert_eq!(err, KeyPackageVerifyError::UnsupportedExtension);
 }
 
 /// Validation of a key package that carries many distinct extensions and
